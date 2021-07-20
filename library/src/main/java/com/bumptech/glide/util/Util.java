@@ -74,7 +74,15 @@ public final class Util {
                 // Do nothing.
             }
         }
-        return bitmap.getHeight() * bitmap.getRowBytes();
+        /// M:[BUG.MODIFY] Fix extreme case come from AMS lifecycle, such as onResume
+        // and onDestroy are very closely together, maybe 100ms, so add the check {
+        //return bitmap.getHeight() * bitmap.getRowBytes();
+        if (bitmap != null) {
+            return bitmap.getHeight() * bitmap.getRowBytes();
+        } else {
+            return 0;
+        }
+        /// @}
     }
 
     /**

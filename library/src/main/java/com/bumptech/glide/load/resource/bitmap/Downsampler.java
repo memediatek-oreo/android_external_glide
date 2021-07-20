@@ -10,6 +10,7 @@ import com.bumptech.glide.load.DecodeFormat;
 import com.bumptech.glide.load.engine.bitmap_recycle.BitmapPool;
 import com.bumptech.glide.util.ByteArrayPool;
 import com.bumptech.glide.util.ExceptionCatchingInputStream;
+import com.bumptech.glide.util.MarkEnforcingInputStream;
 import com.bumptech.glide.util.Util;
 
 import java.io.IOException;
@@ -77,11 +78,12 @@ public abstract class Downsampler implements BitmapDecoder<InputStream> {
         }
     };
 
-    // 5MB. This is the max image header size we can handle, we preallocate a much smaller buffer but will resize up to
-    // this amount if necessary.
-    private static final int MARK_POSITION = 5 * 1024 * 1024;
-
-
+    /// M:[BUG.MODIFY] {
+    // 20MB. This is the max image header size we can handle, we preallocate a much smaller buffer
+    // but will resize up to 20MB, MARK_POSITION default value from 2MB, 5MB, 20MB, and this amount
+    // if necessary; 20MB for large-header stereo images.
+    private static final int MARK_POSITION = 20 * 1024 * 1024;
+    /// @}
     /**
      * Load the image for the given InputStream. If a recycled Bitmap whose dimensions exactly match those of the image
      * for the given InputStream is available, the operation is much less expensive in terms of memory.
@@ -107,20 +109,32 @@ public abstract class Downsampler implements BitmapDecoder<InputStream> {
         final BitmapFactory.Options options = getDefaultOptions();
 
         // TODO(#126): when the framework handles exceptions better, consider removing.
-        final ExceptionCatchingInputStream stream =
-                ExceptionCatchingInputStream.obtain(new RecyclableBufferedInputStream(is, bytesForStream));
+        // Use to fix the mark limit to avoid allocating buffers that fit entire images.
+        RecyclableBufferedInputStream bufferedStream = new RecyclableBufferedInputStream(
+                is, bytesForStream);
+        // Use to retrieve exceptions thrown while reading.
+        // TODO(#126): when the framework no longer returns partially decoded Bitmaps or
+        // provides a way to determine
+        // if a Bitmap is partially decoded, consider removing.
+        ExceptionCatchingInputStream exceptionStream =
+                ExceptionCatchingInputStream.obtain(bufferedStream);
+        // Use to read data.
+        // Ensures that we can always reset after reading an image header so that
+        // we can still attempt to decode the
+        // full image even when the header decode fails and/or overflows our read buffer. See #283.
+        MarkEnforcingInputStream invalidatingStream = new MarkEnforcingInputStream(exceptionStream);
         try {
-            stream.mark(MARK_POSITION);
+            exceptionStream.mark(MARK_POSITION);
             int orientation = 0;
             try {
-                orientation = new ImageHeaderParser(stream).getOrientation();
+                orientation = new ImageHeaderParser(exceptionStream).getOrientation();
             } catch (IOException e) {
                 if (Log.isLoggable(TAG, Log.WARN)) {
                     Log.w(TAG, "Cannot determine the image orientation from header", e);
                 }
             } finally {
                 try {
-                    stream.reset();
+                    exceptionStream.reset();
                 } catch (IOException e) {
                     if (Log.isLoggable(TAG, Log.WARN)) {
                         Log.w(TAG, "Cannot reset the input stream", e);
@@ -130,7 +144,7 @@ public abstract class Downsampler implements BitmapDecoder<InputStream> {
 
             options.inTempStorage = bytesForOptions;
 
-            final int[] inDimens = getDimensions(stream, options);
+            final int[] inDimens = getDimensions(invalidatingStream, bufferedStream, options);
             final int inWidth = inDimens[0];
             final int inHeight = inDimens[1];
 
@@ -138,13 +152,13 @@ public abstract class Downsampler implements BitmapDecoder<InputStream> {
             final int sampleSize = getRoundedSampleSize(degreesToRotate, inWidth, inHeight, outWidth, outHeight);
 
             final Bitmap downsampled =
-                    downsampleWithSize(stream, options, pool, inWidth, inHeight, sampleSize,
-                            decodeFormat);
-
-            // BitmapFactory swallows exceptions during decodes and in some cases when inBitmap is non null, may catch
-            // and log a stack trace but still return a non null bitmap. To avoid displaying partially decoded bitmaps,
-            // we catch exceptions reading from the stream in our ExceptionCatchingInputStream and throw them here.
-            final Exception streamException = stream.getException();
+                    downsampleWithSize(invalidatingStream, bufferedStream, options, pool, inWidth,
+                            inHeight, sampleSize, decodeFormat);
+            // BitmapFactory swallows exceptions during decodes and in some cases when
+            // inBitmap is non null, may catch and log a stack trace but still return a non null
+            // bitmap. To avoid displaying partially decoded bitmaps, we catch exceptions
+            // reading from the stream in our ExceptionCatchingInputStream and throw them here.
+            final Exception streamException = exceptionStream.getException();
             if (streamException != null) {
                 throw new RuntimeException(streamException);
             }
@@ -162,7 +176,7 @@ public abstract class Downsampler implements BitmapDecoder<InputStream> {
         } finally {
             byteArrayPool.releaseBytes(bytesForOptions);
             byteArrayPool.releaseBytes(bytesForStream);
-            stream.release();
+            exceptionStream.release();
             releaseOptions(options);
         }
     }
@@ -187,8 +201,10 @@ public abstract class Downsampler implements BitmapDecoder<InputStream> {
         return Math.max(1, powerOfTwoSampleSize);
     }
 
-    private Bitmap downsampleWithSize(ExceptionCatchingInputStream is, BitmapFactory.Options options, BitmapPool pool,
-            int inWidth, int inHeight, int sampleSize, DecodeFormat decodeFormat) {
+    private Bitmap downsampleWithSize(MarkEnforcingInputStream is,
+            RecyclableBufferedInputStream bufferedStream, BitmapFactory.Options options,
+            BitmapPool pool, int inWidth, int inHeight,
+            int sampleSize, DecodeFormat decodeFormat) {
         // Prior to KitKat, the inBitmap size must exactly match the size of the bitmap we're decoding.
         Bitmap.Config config = getConfig(is, decodeFormat);
         options.inSampleSize = sampleSize;
@@ -199,7 +215,7 @@ public abstract class Downsampler implements BitmapDecoder<InputStream> {
             // BitmapFactory will clear out the Bitmap before writing to it, so getDirty is safe.
             setInBitmap(options, pool.getDirty(targetWidth, targetHeight, config));
         }
-        return decodeStream(is, options);
+        return decodeStream(is, bufferedStream, options);
     }
 
     private static boolean shouldUsePool(InputStream is) {
@@ -282,14 +298,16 @@ public abstract class Downsampler implements BitmapDecoder<InputStream> {
      *              android.graphics.BitmapFactory.Options)}.
      * @return an array containing the dimensions of the image in the form {width, height}.
      */
-    public int[] getDimensions(ExceptionCatchingInputStream is, BitmapFactory.Options options) {
+    public int[] getDimensions(MarkEnforcingInputStream is,
+            RecyclableBufferedInputStream bufferedStream, BitmapFactory.Options options) {
         options.inJustDecodeBounds = true;
-        decodeStream(is, options);
+        decodeStream(is, bufferedStream, options);
         options.inJustDecodeBounds = false;
         return new int[] { options.outWidth, options.outHeight };
     }
 
-    private static Bitmap decodeStream(ExceptionCatchingInputStream is, BitmapFactory.Options options) {
+    private static Bitmap decodeStream(MarkEnforcingInputStream is,
+            RecyclableBufferedInputStream bufferedStream, BitmapFactory.Options options) {
          if (options.inJustDecodeBounds) {
              // This is large, but jpeg headers are not size bounded so we need something large enough to minimize
              // the possibility of not being able to fit enough of the header in the buffer to get the image size so
@@ -301,7 +319,7 @@ public abstract class Downsampler implements BitmapDecoder<InputStream> {
              // Once we've read the image header, we no longer need to allow the buffer to expand in size. To avoid
              // unnecessary allocations reading image data, we fix the mark limit so that it is no larger than our
              // current buffer size here. See issue #225.
-             is.fixMarkLimit();
+             bufferedStream.fixMarkLimit();
          }
 
         final Bitmap result = BitmapFactory.decodeStream(is, null, options);

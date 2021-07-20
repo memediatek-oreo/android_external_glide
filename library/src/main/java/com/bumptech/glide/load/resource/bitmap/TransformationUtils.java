@@ -270,7 +270,13 @@ public final class TransformationUtils {
 
         Bitmap result = pool.get(newWidth, newHeight, toOrient.getConfig());
         if (result == null) {
-            result = Bitmap.createBitmap(newWidth, newHeight, toOrient.getConfig());
+            /// M: [BUG.MODIFY] @{
+            // Config is null for Gif files in Album
+            /* result = Bitmap.createBitmap(newWidth, newHeight, toOrient.getConfig());*/
+            Bitmap.Config config = toOrient.getConfig() != null ?
+                                   toOrient.getConfig() : Bitmap.Config.ARGB_8888;
+            result = Bitmap.createBitmap(newWidth, newHeight, config);
+            /// @}
         }
 
         matrix.postTranslate(-newRect.left, -newRect.top);
